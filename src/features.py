@@ -27,14 +27,14 @@ def identify_heatwaves(tmax_values, threshold=38.0):
 def validate_hwu_formula():
     hws = identify_heatwaves([36, 40, 42, 39, 35])
     assert len(hws)==1 and hws[0]['duration']==3 and abs(hws[0]['hwu']-7)<0.01
-    print(f'✅ HWU: [40,42,39] → HWU=7°C (2+4+1)')
+    print('✅ HWU: [40,42,39] → HWU=7°C (2+4+1)')
     assert len(identify_heatwaves([39, 40, 35]))==1
-    print(f'✅ Minimum heatwave (2 days) detected')
+    print('✅ Minimum heatwave (2 days) detected')
     assert len(identify_heatwaves([35, 40, 35]))==0
-    print(f'✅ Single hot day excluded')
+    print('✅ Single hot day excluded')
     assert len(identify_heatwaves([39,40,35,39,41,38,35]))==2
-    print(f'✅ Two separate heatwaves detected')
-    print(f'\n✅ All validation tests passed!')
+    print('✅ Two separate heatwaves detected')
+    print('\n✅ All validation tests passed!')
 
 def compute_heat_features(tmax_values, vpd_max_values=None, tavg_values=None, rain_values=None, prefix=''):
     tmax = np.array(tmax_values, dtype=float)
@@ -70,20 +70,18 @@ def build_feature_matrix(weather_df, phenology_df=None):
     pheno_lookup = None
     if phenology_df is not None:
         pheno = phenology_df.copy()
-        # Convert date strings to DOY (day of year) integers
         for col in ['Budbreak', 'Flowering', 'Veraison', 'Harvest']:
             if col in pheno.columns:
                 pheno[col] = pd.to_datetime(pheno[col], errors='coerce').dt.dayofyear
-        # Average DOY across blocks within each site×year
         pheno_lookup = pheno.groupby(['Site','Season']).agg(
             {'Budbreak':'mean','Flowering':'mean','Veraison':'mean','Harvest':'mean'}).reset_index()
         for col in ['Budbreak','Flowering','Veraison','Harvest']:
             pheno_lookup[col] = pheno_lookup[col].round().astype('Int64')
-        print(f'Phenology: {pheno_lookup.dropna().shape[0]} site×year with complete records')
+        print(f'Phenology: {pheno_lookup.dropna().shape[0]} site x year with complete records')
     all_features = []
     sites = sorted(df['Site'].unique())
     years = sorted(df['_year'].unique())
-    print(f'Processing {len(sites)} sites × {len(years)} years ...')
+    print(f'Processing {len(sites)} sites x {len(years)} years ...')
     for site in sites:
         for year in years:
             sy = df[(df['Site']==site) & (df['_year']==year)]
@@ -94,4 +92,51 @@ def build_feature_matrix(weather_df, phenology_df=None):
             tavg = gs['tmean'].values
             vpd = gs['vpdmax'].values if 'vpdmax' in gs.columns else None
             rain = gs['rain'].values if 'rain' in gs.columns else None
-            
+            feats.update(compute_heat_features(tmax, vpd, tavg, rain, prefix='season'))
+            feats['gdd_apr_oct'] = float(np.sum(np.maximum(tavg-10, 0)))
+            for m, mn in {4:'Apr',5:'May',6:'Jun',7:'Jul',8:'Aug',9:'Sep',10:'Oct'}.items():
+                md = gs[gs['_month']==m]
+                if len(md)==0: continue
+                feats.update(compute_heat_features(md['tmax'].values,
+                    md['vpdmax'].values if vpd is not None else None,
+                    md['tmean'].values, md['rain'].values if rain is not None else None, prefix=mn))
+            for subset, pfx in [(gs[(gs['_month']>=5)&(gs['_month']<=7)],'MayJul'),
+                                 (gs[(gs['_month']>=8)&(gs['_month']<=10)],'AugOct')]:
+                if len(subset)>0:
+                    feats.update(compute_heat_features(subset['tmax'].values,
+                        subset['vpdmax'].values if vpd is not None else None,
+                        subset['tmean'].values, subset['rain'].values if rain is not None else None, prefix=pfx))
+            if pheno_lookup is not None:
+                p_row = pheno_lookup[(pheno_lookup['Site']==site)&(pheno_lookup['Season']==year)]
+                if len(p_row)>0:
+                    pr = p_row.iloc[0]
+                    fl = pr.get('Flowering')
+                    ver = pr.get('Veraison')
+                    har = pr.get('Harvest')
+                    bb = pr.get('Budbreak')
+                    if pd.notna(fl) and pd.notna(ver):
+                        fl_ver = sy[(sy['_doy']>=int(fl))&(sy['_doy']<int(ver))]
+                        if len(fl_ver)>0:
+                            feats.update(compute_heat_features(fl_ver['tmax'].values,
+                                fl_ver['vpdmax'].values if vpd is not None else None,
+                                fl_ver['tmean'].values, prefix='FLtoVER'))
+                    if pd.notna(ver) and pd.notna(har):
+                        ver_h = sy[(sy['_doy']>=int(ver))&(sy['_doy']<=int(har))]
+                        if len(ver_h)>0:
+                            feats.update(compute_heat_features(ver_h['tmax'].values,
+                                ver_h['vpdmax'].values if vpd is not None else None,
+                                ver_h['tmean'].values, prefix='VERtoH'))
+                    if pd.notna(bb) and pd.notna(har):
+                        bb_h = sy[(sy['_doy']>=int(bb))&(sy['_doy']<=int(har))]
+                        if len(bb_h)>0:
+                            feats.update(compute_heat_features(bb_h['tmax'].values,
+                                bb_h['vpdmax'].values if vpd is not None else None,
+                                bb_h['tmean'].values, prefix='BBtoH'))
+            all_features.append(feats)
+    fm = pd.DataFrame(all_features)
+    n_pheno = len([c for c in fm.columns if c.startswith(('FLtoVER','VERtoH','BBtoH'))])
+    n_chrono = len([c for c in fm.columns if c not in ['site','year'] and not c.startswith(('FLtoVER','VERtoH','BBtoH'))])
+    print(f'\nDone! {fm.shape[0]} rows x {fm.shape[1]} columns')
+    print(f'  Chronological features: {n_chrono}')
+    print(f'  Phenology-based features: {n_pheno}')
+    return fm
